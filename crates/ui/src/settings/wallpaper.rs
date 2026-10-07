@@ -141,6 +141,7 @@ struct PreloadQueue {
     generation: u64,
     loading: bool,
     error: Option<String>,
+    initializing: bool,
 }
 impl Global for PreloadQueue {}
 
@@ -246,6 +247,28 @@ fn take_ready(cx: &mut App) -> Option<Result<(), String>> {
 }
 
 pub fn randomize(cx: &mut App) -> Task<Result<(), String>> {
+    select(cx, false)
+}
+
+/// One automatic selection per app, including when its originating Shell closes.
+/// Manual Shuffle remains an independent request.
+pub fn initialize(cx: &mut App) -> Option<Task<Result<(), String>>> {
+    synchronize(cx);
+    if !super::needs_initial_wallpaper(&super::current(cx))
+        || cx.global::<PreloadQueue>().initializing
+    {
+        return None;
+    }
+    cx.global_mut::<PreloadQueue>().initializing = true;
+    let task = select(cx, true);
+    Some(cx.spawn(async move |cx| {
+        let result = task.await;
+        cx.update(|cx| cx.global_mut::<PreloadQueue>().initializing = false);
+        result
+    }))
+}
+
+fn select(cx: &mut App, initial: bool) -> Task<Result<(), String>> {
     synchronize(cx);
     // A user request retries a failed speculative preload (e.g. a folder that
     // has since been restored), but background rendering never spins on errors.
@@ -262,7 +285,12 @@ pub fn randomize(cx: &mut App) -> Task<Result<(), String>> {
         }
         loop {
             let result = cx.update(|cx| {
-                if super::current(cx).wallpaper_folder != folder {
+                let settings = super::current(cx);
+                // Another window, manual selection, or explicit removal may
+                // have satisfied/cancelled initialization while decoding.
+                if settings.wallpaper_folder != folder
+                    || (initial && !super::needs_initial_wallpaper(&settings))
+                {
                     return Some(Ok(()));
                 }
                 preload(cx);
@@ -296,6 +324,149 @@ mod tests {
                 .unwrap();
         }
         folder
+    }
+
+    #[gpui::test]
+    fn competing_initializations_commit_once_and_manual_shuffle_stays_independent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = wallpaper_folder(dir.path());
+        cx.update(|cx| {
+            super::super::init(
+                super::super::UiSettings {
+                    wallpaper_folder: Some(folder),
+                    ..Default::default()
+                },
+                dir.path().join("data"),
+                cx,
+            );
+            // Both calls occur before any decoder can publish, as with a
+            // closing Shell followed by a newly constructed Shell.
+            initialize(cx).unwrap().detach();
+            assert!(initialize(cx).is_none());
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        let first = cx.update(|cx| {
+            assert!(!cx.global::<PreloadQueue>().initializing);
+            let settings = super::super::current(cx);
+            assert_eq!(settings.wallpaper_history.len(), 1);
+            assert!(settings.new_thread_composer_background.is_some());
+            assert!(initialize(cx).is_none());
+            settings
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                super::super::current(cx),
+                first,
+                "no second automatic commit"
+            );
+            randomize(cx).detach();
+            assert_ne!(
+                super::super::current(cx).wallpaper_source,
+                first.wallpaper_source
+            );
+            assert_eq!(super::super::current(cx).wallpaper_history.len(), 2);
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn pending_initialization_rechecks_removal_and_manual_selection_before_commit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = wallpaper_folder(dir.path());
+        cx.update(|cx| {
+            super::super::init(
+                super::super::UiSettings {
+                    wallpaper_folder: Some(folder.clone()),
+                    ..Default::default()
+                },
+                dir.path().join("data"),
+                cx,
+            );
+            initialize(cx).unwrap().detach();
+            super::super::remove_new_thread_composer_background(cx).unwrap();
+            assert!(super::super::current(cx).wallpaper_disabled);
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                super::super::current(cx)
+                    .new_thread_composer_background
+                    .is_none()
+            );
+            assert!(initialize(cx).is_none());
+            randomize(cx).detach();
+            assert!(
+                super::super::current(cx)
+                    .new_thread_composer_background
+                    .is_some()
+            );
+            assert!(!super::super::current(cx).wallpaper_disabled);
+            // Missing managed images recover; a manual selection wins even
+            // while an automatic recovery request is outstanding.
+            let path = super::super::current(cx)
+                .new_thread_composer_background
+                .unwrap()
+                .path;
+            std::fs::remove_file(path).unwrap();
+            super::super::set_new_thread_background_effect(
+                super::super::NewThreadBackgroundEffect::Ascii,
+                cx,
+            );
+            initialize(cx).unwrap().detach();
+            super::super::install_new_thread_composer_background(&folder.join("0.png"), cx)
+                .unwrap();
+        });
+        let manual = cx.update(|cx| super::super::current(cx));
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(super::super::current(cx), manual));
+    }
+
+    #[gpui::test]
+    fn legacy_removed_folder_stays_empty_until_manual_shuffle(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = wallpaper_folder(dir.path());
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            super::super::UiSettings::path(&data),
+            serde_json::json!({"wallpaperFolder": folder}).to_string(),
+        )
+        .unwrap();
+        cx.update(|cx| {
+            super::super::init(super::super::UiSettings::load(&data), &data, cx);
+            assert!(initialize(cx).is_none());
+            preload(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                super::super::current(cx)
+                    .new_thread_composer_background
+                    .is_none()
+            );
+            randomize(cx).detach();
+            let selected = super::super::current(cx);
+            assert!(selected.new_thread_composer_background.is_some());
+            assert!(!selected.wallpaper_disabled);
+            assert_eq!(super::super::UiSettings::load(&data), selected);
+        });
+        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -586,5 +757,154 @@ mod tests {
         std::fs::remove_file(&first).unwrap();
         assert!(choose(dir.path(), &[]).is_err());
         assert!(choose(&dir.path().join("missing"), &[]).is_err());
+    }
+
+    #[test]
+    fn needs_initial_wallpaper_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("wallpapers");
+        std::fs::create_dir_all(&folder).unwrap();
+        let image_file = dir.path().join("bg.png");
+        image::RgbaImage::new(2, 2).save(&image_file).unwrap();
+
+        // Case A: folder configured, no background, not disabled -> needs initial wallpaper
+        let mut settings = super::super::UiSettings {
+            wallpaper_folder: Some(folder.clone()),
+            wallpaper_disabled: false,
+            new_thread_composer_background: None,
+            ..Default::default()
+        };
+        assert!(super::super::needs_initial_wallpaper(&settings));
+
+        // Case B: folder configured, valid background file on disk -> does NOT need initial wallpaper
+        settings.new_thread_composer_background = Some(super::super::NewThreadComposerBackground {
+            path: image_file.to_string_lossy().into_owned(),
+            name: "bg.png".into(),
+            adjustment: Default::default(),
+        });
+        assert!(!super::super::needs_initial_wallpaper(&settings));
+
+        // Case C: folder configured, background file deleted/missing -> needs initial wallpaper
+        let missing_file = dir.path().join("deleted.png");
+        settings.new_thread_composer_background = Some(super::super::NewThreadComposerBackground {
+            path: missing_file.to_string_lossy().into_owned(),
+            name: "deleted.png".into(),
+            adjustment: Default::default(),
+        });
+        assert!(super::super::needs_initial_wallpaper(&settings));
+
+        // Case I: folder configured, but user explicitly removed wallpaper (wallpaper_disabled = true)
+        // -> must NOT auto-populate on startup!
+        settings.wallpaper_disabled = true;
+        settings.new_thread_composer_background = None;
+        assert!(!super::super::needs_initial_wallpaper(&settings));
+
+        settings.wallpaper_disabled = false;
+        assert!(super::super::needs_initial_wallpaper(&settings));
+
+        // No folder configured -> false regardless of other flags
+        settings.wallpaper_folder = None;
+        settings.wallpaper_disabled = false;
+        assert!(!super::super::needs_initial_wallpaper(&settings));
+    }
+
+    #[gpui::test]
+    fn startup_wallpaper_lifecycle_integration(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = wallpaper_folder(dir.path());
+        let data = dir.path().join("data");
+
+        // Case A: Startup with folder configured and no background -> selects an image
+        cx.update(|cx| {
+            cx.set_global(crate::theme::Theme::default());
+            super::super::init(
+                super::super::UiSettings {
+                    wallpaper_folder: Some(folder.clone()),
+                    ..Default::default()
+                },
+                &data,
+                cx,
+            );
+            assert!(super::super::needs_initial_wallpaper(
+                &super::super::current(cx)
+            ));
+            initialize(cx).unwrap().detach();
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+
+        // Verify image was selected and committed
+        let first_bg = cx.update(|cx| {
+            let current = super::super::current(cx);
+            assert!(!current.wallpaper_disabled);
+            let bg = current
+                .new_thread_composer_background
+                .clone()
+                .expect("wallpaper selected");
+            assert!(std::path::Path::new(&bg.path).is_file());
+            assert!(!super::super::needs_initial_wallpaper(&current));
+            bg
+        });
+
+        // Case B: Restart with existing valid image -> needs_initial_wallpaper is false
+        cx.update(|cx| {
+            let current = super::super::current(cx);
+            assert_eq!(
+                current
+                    .new_thread_composer_background
+                    .as_ref()
+                    .map(|b| &b.path),
+                Some(&first_bg.path)
+            );
+            assert!(!super::super::needs_initial_wallpaper(&current));
+            assert!(initialize(cx).is_none());
+        });
+
+        // Case I: Explicit Remove wallpaper -> sets wallpaper_disabled = true
+        cx.update(|cx| {
+            let _ = super::super::remove_new_thread_composer_background(cx);
+            let current = super::super::current(cx);
+            assert!(current.wallpaper_disabled);
+            assert!(current.new_thread_composer_background.is_none());
+            // After restart, must NOT auto-select
+            assert!(!super::super::needs_initial_wallpaper(&current));
+        });
+
+        // Case H: Manual shuffle clears wallpaper_disabled and selects a new wallpaper
+        cx.update(|cx| {
+            randomize(cx).detach();
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let current = super::super::current(cx);
+            assert!(!current.wallpaper_disabled);
+            assert!(current.new_thread_composer_background.is_some());
+        });
+
+        // Case C: If the current background file on disk is deleted, needs_initial_wallpaper returns true
+        cx.update(|cx| {
+            let current = super::super::current(cx);
+            let bg = current.new_thread_composer_background.clone().unwrap();
+            std::fs::remove_file(&bg.path).unwrap();
+            assert!(super::super::needs_initial_wallpaper(
+                &super::super::current(cx)
+            ));
+            initialize(cx).unwrap().detach();
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let settings = super::super::current(cx);
+            assert!(!super::super::needs_initial_wallpaper(&settings));
+            assert!(Path::new(&settings.new_thread_composer_background.unwrap().path).is_file());
+        });
     }
 }

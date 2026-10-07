@@ -459,6 +459,7 @@ fn commit_background(
     wallpaper::remember(&mut next.wallpaper_history, source);
     next.wallpaper_source = Some(source.to_path_buf());
     next.wallpaper_color = color;
+    next.wallpaper_disabled = false;
     let previous = next
         .new_thread_composer_background
         .replace(replacement.clone());
@@ -489,9 +490,7 @@ pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String>
     let previous = next.new_thread_composer_background.take();
     next.wallpaper_source = None;
     next.wallpaper_color = None;
-    if previous.is_none() {
-        return Ok(());
-    }
+    next.wallpaper_disabled = true;
     if next.save(&data_dir).is_err() {
         return Err(
             "Unable to remove the image. Check folder permissions and try again.".to_string(),
@@ -507,6 +506,19 @@ pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String>
     }
     cx.refresh_windows();
     Ok(())
+}
+
+/// Returns true if a wallpaper folder is configured and an initial wallpaper
+/// needs to be selected because there is currently no valid active background,
+/// and the user has not explicitly removed the wallpaper.
+pub fn needs_initial_wallpaper(settings: &UiSettings) -> bool {
+    if settings.wallpaper_folder.is_none() || settings.wallpaper_disabled {
+        return false;
+    }
+    match &settings.new_thread_composer_background {
+        None => true,
+        Some(background) => !std::path::Path::new(&background.path).is_file(),
+    }
 }
 
 pub fn set_new_thread_background_effect(effect: NewThreadBackgroundEffect, cx: &mut App) {
@@ -959,6 +971,9 @@ pub struct UiSettings {
     pub wallpaper_history: Vec<PathBuf>,
     pub wallpaper_theme_colors: bool,
     pub wallpaper_color: Option<zeron_theme::Color>,
+    /// Whether the user explicitly removed/disabled the wallpaper.
+    #[serde(default)]
+    pub wallpaper_disabled: bool,
     /// Non-destructive treatment composited inside the artwork's fade mask.
     pub new_thread_background_effect: NewThreadBackgroundEffect,
     /// Snap animations to rest. Defaults to following the OS.
@@ -1055,6 +1070,7 @@ impl Default for UiSettings {
             wallpaper_history: Vec::new(),
             wallpaper_theme_colors: false,
             wallpaper_color: None,
+            wallpaper_disabled: false,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             reduce_motion: crate::motion::ReduceMotion::System,
             pause_animations_in_background: false,
@@ -1696,6 +1712,7 @@ impl UiSettings {
             wallpaper_history,
             wallpaper_theme_colors,
             wallpaper_color,
+            wallpaper_disabled,
             new_thread_background_effect,
             reduce_motion,
             pause_animations_in_background,
@@ -1763,6 +1780,19 @@ impl UiSettings {
             Ok(text) => {
                 match serde_json::from_str::<serde_json::Value>(&text).and_then(|mut value| {
                     if let Some(settings) = value.as_object_mut() {
+                        // Upstream removal kept the folder but cleared the image. An
+                        // absent marker cannot distinguish removal from incomplete setup:
+                        // preserve that intent until the user explicitly selects an image.
+                        if !settings.contains_key("wallpaperDisabled")
+                            && settings
+                                .get("wallpaperFolder")
+                                .is_some_and(|v| !v.is_null())
+                            && settings
+                                .get("newThreadComposerBackground")
+                                .is_none_or(|v| v.is_null())
+                        {
+                            settings.insert("wallpaperDisabled".into(), serde_json::json!(true));
+                        }
                         let previous_sound = settings
                             .get("soundEnabled")
                             .and_then(serde_json::Value::as_bool)
@@ -2497,6 +2527,84 @@ mod tests {
         });
     }
 
+    #[test]
+    fn wallpaper_legacy_removal_is_preserved_but_known_new_folders_initialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("wallpapers");
+        for background in [None, Some(serde_json::Value::Null)] {
+            let mut json = serde_json::json!({"wallpaperFolder": folder, "sidebarWidth": 280.0});
+            if let Some(background) = background {
+                json["newThreadComposerBackground"] = background;
+            }
+            std::fs::write(UiSettings::path(dir.path()), json.to_string()).unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert!(loaded.wallpaper_disabled);
+            assert!(!needs_initial_wallpaper(&loaded));
+            assert_eq!(loaded.sidebar_width, 280.0);
+            loaded.save(dir.path()).unwrap();
+            assert_eq!(UiSettings::load(dir.path()), loaded);
+        }
+        let known_new = UiSettings {
+            wallpaper_folder: Some(folder),
+            ..Default::default()
+        };
+        known_new.save(dir.path()).unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(!loaded.wallpaper_disabled);
+        assert!(needs_initial_wallpaper(&loaded));
+        let image = dir.path().join("existing.png");
+        image::RgbaImage::new(2, 2).save(&image).unwrap();
+        let existing = UiSettings {
+            new_thread_composer_background: Some(NewThreadComposerBackground {
+                path: image.to_string_lossy().into_owned(),
+                name: "existing.png".into(),
+                adjustment: Default::default(),
+            }),
+            ..known_new
+        };
+        let mut legacy = serde_json::to_value(&existing).unwrap();
+        legacy.as_object_mut().unwrap().remove("wallpaperDisabled");
+        std::fs::write(UiSettings::path(dir.path()), legacy.to_string()).unwrap();
+        assert_eq!(UiSettings::load(dir.path()), existing);
+        assert!(!needs_initial_wallpaper(&existing));
+    }
+
+    #[test]
+    fn wallpaper_removal_three_way_merge_preserves_independent_updates() {
+        let base = UiSettings::default();
+        let removed = UiSettings {
+            wallpaper_disabled: true,
+            ..base.clone()
+        };
+        let concurrent = UiSettings {
+            sidebar_width: 280.0,
+            ..base.clone()
+        };
+        let merged = UiSettings::merge_changes(&base, &removed, concurrent);
+        assert!(merged.wallpaper_disabled);
+        assert_eq!(merged.sidebar_width, 280.0);
+
+        let edited = UiSettings {
+            sidebar_width: 300.0,
+            ..base.clone()
+        };
+        let merged = UiSettings::merge_changes(&base, &edited, removed.clone());
+        assert!(merged.wallpaper_disabled);
+        assert_eq!(merged.sidebar_width, 300.0);
+
+        let selected = UiSettings {
+            wallpaper_disabled: false,
+            ..removed.clone()
+        };
+        let concurrent = UiSettings {
+            sidebar_width: 280.0,
+            ..removed.clone()
+        };
+        let merged = UiSettings::merge_changes(&removed, &selected, concurrent);
+        assert!(!merged.wallpaper_disabled);
+        assert_eq!(merged.sidebar_width, 280.0);
+    }
+
     #[gpui::test]
     fn invalid_background_replacement_preserves_previous_image_and_settings(
         cx: &mut gpui::TestAppContext,
@@ -2746,6 +2854,7 @@ mod tests {
                 },
             }),
             wallpaper_folder: Some("/tmp/wallpapers".into()),
+            wallpaper_disabled: false,
             wallpaper_source: Some("/tmp/wallpapers/background.png".into()),
             wallpaper_history: vec!["/tmp/wallpapers/background.png".into()],
             wallpaper_theme_colors: false,

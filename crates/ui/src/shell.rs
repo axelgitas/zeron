@@ -2353,7 +2353,7 @@ impl Shell {
             shell: shell.downgrade(),
             _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
         });
-        Self {
+        let mut this = Self {
             state,
             sidebar_pane,
             transcript,
@@ -2547,7 +2547,9 @@ impl Shell {
             _composer_events: composer_events,
             _transcript_events: transcript_events,
             _transcript_invalidation: transcript_invalidation,
-        }
+        };
+        this.bootstrap_wallpaper(cx);
+        this
     }
 
     /// Route a completed viewer-side capture only after its source window is
@@ -4727,6 +4729,22 @@ impl Shell {
             ));
             self.appearance_page = Some(page);
         }
+    }
+
+    fn bootstrap_wallpaper(&mut self, cx: &mut Context<Self>) {
+        let Some(task) = settings::wallpaper::initialize(cx) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(page) = &this.appearance_page {
+                        page.update(cx, |page, cx| page.show_wallpaper_error(error, cx));
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     fn random_wallpaper(&mut self, cx: &mut Context<Self>) {
@@ -15076,6 +15094,7 @@ mod exit_regressions {
                     s.sidebar_show_branch = !before.sidebar_show_branch;
                     s.escape_stops_active_agent = !before.escape_stops_active_agent;
                 });
+                settings::update(SavePolicy::Immediate, cx, |s| s.wallpaper_disabled = true);
                 // Navigating away saves the shell's own working copy.
                 shell.remember_settings_section(SettingsSection::Notifications, cx);
                 // The shell's own writes still land.
@@ -15099,6 +15118,7 @@ mod exit_regressions {
             SettingsSection::Notifications.canonical()
         );
         assert_eq!(after.sidebar_width, before.sidebar_width + 10.0);
+        assert!(after.wallpaper_disabled);
     }
 
     #[gpui::test]
